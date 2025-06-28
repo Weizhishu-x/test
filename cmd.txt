@@ -1,0 +1,5 @@
+GPUS_PER_NODE=2 ./tools/run_dist_launch.sh 2 ./configs/r50_deformable_detr.sh
+./configs/r50_deformable_detr_plus_iterative_bbox_refinement_plus_plus_two_stage.sh --resume ./exps/r50_deformable_detr_plus_iterative_bbox_refinement_plus_plus_two_stage_b8_target/best_checkpoint.pth --eval
+
+
+GPUS_PER_NODE=2 ./tools/run_dist_launch.sh 2 ./configs/r50_deformable_detr_plus_iterative_bbox_refinement_plus_plus_two_stage_b16_source.sh 
