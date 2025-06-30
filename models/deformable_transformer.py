@@ -38,7 +38,7 @@ class DeformableTransformer(nn.Module):
                                                         dropout, activation,
                                                         num_feature_levels, nhead, dec_n_points)
         self.decoder = DeformableTransformerDecoder(decoder_layer, num_decoder_layers, return_intermediate_dec)
-
+        self.mae_decoder = None
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
 
         if two_stage:
@@ -62,6 +62,27 @@ class DeformableTransformer(nn.Module):
             xavier_uniform_(self.reference_points.weight.data, gain=1.0)
             constant_(self.reference_points.bias.data, 0.)
         normal_(self.level_embed)
+
+    def build_mae_decoder(self, image_size, mae_layers, device, channel0=512):
+        # Generate spatial shape according to image size
+        h, w, c = math.ceil(image_size[0] / 8), math.ceil(image_size[1] / 8), channel0
+        total_spatial_shapes = []
+        for i in range(3):
+            total_spatial_shapes.append([h, w, c])
+            h = math.ceil(h / 2)
+            w = math.ceil(w / 2)
+            c *= 2
+        # Build mae decoder
+        self.mae_decoder = DeformableTransformerDecoderMAE(
+            hidden_dim=self.hidden_dim,
+            feedforward_dim=self.feedforward_dim,
+            num_heads=self.num_heads,
+            dropout=self.dropout,
+            num_feature_levels=self.num_feature_levels,
+            mae_layers=mae_layers,
+            total_spatial_shapes=total_spatial_shapes,
+        )
+        self.mae_decoder.to(device)
 
     def get_proposal_pos_embed(self, proposals):
         num_pos_feats = 128
@@ -354,6 +375,69 @@ class DeformableTransformerDecoder(nn.Module):
             return torch.stack(intermediate), torch.stack(intermediate_reference_points)
 
         return output, reference_points
+
+
+class DeformableTransformerDecoderMAE(DeformableTransformerDecoder):
+
+    def __init__(self,
+                 d_model=256,
+                 dim_feedforward=1024,
+                 nhead=8,
+                 dropout=0.1,
+                 activation='relu',
+                 num_feature_levels=4,
+                 n_points=4,
+                 num_layers=2,
+                 return_intermediate=False,
+                 mae_layers=None,
+                 total_spatial_shapes=None):
+        mae_layers = [] if mae_layers is None else mae_layers
+        total_spatial_shapes = [] if total_spatial_shapes is None else total_spatial_shapes
+        decoder_layer = DeformableTransformerDecoderLayer(
+            d_model, dim_feedforward,
+            dropout, activation,
+            num_feature_levels, nhead, n_points
+        )
+        super(DeformableTransformerDecoderMAE, self).__init__(decoder_layer, num_layers, return_intermediate)
+        self.mae_layers = mae_layers
+        self.spatial_shapes = [
+            total_spatial_shapes[mae_layer] for mae_layer in mae_layers
+        ]
+        self.d_model = d_model
+        self.mask_query = nn.Embedding(1, d_model)
+        self.query_embed_list = nn.ModuleList([
+            nn.Embedding(h * w, d_model * 2)
+            for h, w, c in self.spatial_shapes
+        ])
+        self.reference_points = nn.Linear(d_model, 2)
+        self.output_proj = nn.ModuleList([
+            nn.Linear(d_model, c)
+            for h, w, c in self.spatial_shapes
+        ])
+
+    def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
+                query_pos=None, mask_flatten=None):
+        bs = src.shape[0]
+        mae_output = []
+        for i, mae_layer in enumerate(self.mae_layers):
+            query_pos, tgt = torch.split(self.query_embed_list[i].weight, self.d_model, dim=1)
+            query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
+            tgt = tgt.unsqueeze(0).expand(bs, -1, -1)
+            tgt_mask = mask_flatten[:, src_level_start_index[mae_layer]: src_level_start_index[mae_layer+1]]
+            tgt_mask = torch.unsqueeze(tgt_mask, -1)
+            h, w, c = self.spatial_shapes[i]
+            tgt = tgt * (~tgt_mask).to(tgt.dtype) + self.mask_query.weight.\
+                expand(bs, h * w, -1) * tgt_mask.to(tgt.dtype)
+            reference_points = self.reference_points(query_pos).sigmoid()
+            hs, _, _ = super(DeformableTransformerDecoderMAE, self).forward(
+                tgt, reference_points, src,
+                src_spatial_shapes, src_level_start_index,
+                src_valid_ratios, query_pos, mask_flatten
+            )
+            output = self.output_proj[i](hs)
+            mae_output.append(output.transpose(-2, -1).reshape(-1, c, h, w))
+        return mae_output
+    
 
 
 def _get_clones(module, N):

@@ -22,6 +22,7 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
 
 from .backbone import build_backbone
 from .matcher import build_matcher
+from .MAEDecoder import build_MAEDecoder, StandardMAEDecoder
 from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
                            dice_loss, sigmoid_focal_loss)
 from .deformable_transformer import build_deforamble_transformer
@@ -33,10 +34,30 @@ import copy
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
+class MLP(nn.Module):
+    """ Very simple multi-layer perceptron (also called FFN)"""
 
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        #input_dim:256,hidden_dim:256,output_dim:1,num_layers:3
+        """
+        Args:
+            input_dim: 输入维度
+            hidden_dim: 隐藏层维度
+            output_dim: 输出维度
+            num_layers: 网络层数
+        """
+        super().__init__()
+        self.num_layers = num_layers #3
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x
+    
 class DeformableDETR(nn.Module):
     """ This is the Deformable DETR module that performs object detection """
-    def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
+    def __init__(self, backbone, backbone_freezed, transformer, num_classes, num_queries, num_feature_levels,
                  aux_loss=True, with_box_refine=False, two_stage=False, args=None):
         """ Initializes the model.
         Parameters:
@@ -61,6 +82,33 @@ class DeformableDETR(nn.Module):
             self.query_embed = nn.Embedding(num_queries, hidden_dim*2)
         
         self.backbone = backbone
+        self.backbone_freezed = backbone_freezed
+
+        # --- 实例化 MAEDecoder ---
+        encoder_dim = backbone[0].hidden_size
+        patch_size = backbone[0].patch_size
+        num_patches = (args.img_size // patch_size) ** 2
+        self.MAEDecoder = StandardMAEDecoder(
+            num_patches=num_patches,
+            encoder_dim=encoder_dim,
+            decoder_embed_dim=512, 
+            decoder_depth=8,
+            decoder_num_heads=16
+        )
+        # ===========================
+
+        # --- 实例化判别器 ---
+        self.dis_enc = MLP(hidden_dim, hidden_dim, 1, 3)  # 用于 DINOv2 特征对齐的判别器
+        self.dis_dec = MLP(hidden_dim, hidden_dim, 1, 3)  # 用于 Object Queries 特征对齐的判别器
+        for layer in self.dis_enc.layers:
+            nn.init.xavier_uniform_(layer.weight, gain=1)
+            nn.init.constant_(layer.bias, 0)
+        for layer in self.dis_dec.layers:
+            nn.init.xavier_uniform_(layer.weight, gain=1)
+            nn.init.constant_(layer.bias, 0)
+        self.GRL = GradientReversal()  # 梯度反转层，用于对抗训练
+        # ===========================
+        
         self.aux_loss = aux_loss
         self.with_box_refine = with_box_refine
         self.two_stage = two_stage
@@ -90,10 +138,6 @@ class DeformableDETR(nn.Module):
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
         
-        self.uda = False
-        if args.DA_mode == 'uda':
-            self.uda = True
-            self.attention_discriminator = AttentionDiscriminator(input_dim=2, hidden_dim=256)
 
     def forward(self, samples: NestedTensor, targets=None):
         """ The forward expects a NestedTensor, which consists of:
@@ -112,7 +156,29 @@ class DeformableDETR(nn.Module):
         """
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
-        features, attention_maps, pos = self.backbone(samples)
+        features, pos = self.backbone(samples)
+
+        if self.training:
+            mae_features, mae_mask, ids_restore = self.backbone[0].forward_mae(samples.tensors)
+            with torch.no_grad():
+                self.backbone_freezed.eval()
+                F_teacher = self.backbone_freezed.forward_freezed(samples)
+            # --- MAE编码器重建 ---
+            pred_tokens = self.MAEDecoder(mae_features, ids_restore)
+            # a. 将tokens序列变回2D特征图的形状
+            B = pred_tokens.shape[0]
+            h_patch = w_patch = int(self.MAEDecoder.num_patches**0.5)
+            # (B, N, D) -> (B, H_patch, W_patch, D)
+            pred_feature_map = pred_tokens.reshape(B, h_patch, w_patch, self.MAEDecoder.encoder_dim)
+            # (B, H_patch, W_patch, D) -> (B, D, H_patch, W_patch)
+            pred_feature_map = pred_feature_map.permute(0, 3, 1, 2)
+            
+            # b. 然后，使用与学生/专家模型共享的MultiScaleProjector得到最终的多尺度输出
+            # 注意：这里的输入需要是列表格式
+            # 我们假设投影器能处理一个只包含最深层特征的列表
+            F_reconstructed = self.backbone[0].projector([pred_feature_map] * len(self.backbone[0].feature_extraction_layers))
+
+
 
         srcs = []
         masks = []
@@ -148,22 +214,41 @@ class DeformableDETR(nn.Module):
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
 
-        if self.training and self.uda:
+        if self.training:
             B = outputs_class.shape[1]
             da_output = {}
 
-            # --由于域适应，一半的batch为目标域，没有label，因此只计算源域的预测结果
+            # --- 只计算源域的预测结果 ---
             outputs_class = outputs_class[:, :B // 2]
             outputs_coord = outputs_coord[:, :B // 2]
             if self.two_stage:
                 enc_outputs_class = enc_outputs_class[:B // 2]
                 enc_outputs_coord_unact = enc_outputs_coord_unact[:B // 2]
             
-            # -- 对齐部分
-            out_attention_maps = []
-            for i, attention_map in enumerate(attention_maps):
-                out_attention_maps.append(self.attention_discriminator(attention_map))
-            da_output['backbone'] = torch.cat(out_attention_maps, dim=1)  # [B, num_patches, 1]
+            # --- 对齐部分 ---
+            # a. 对齐 DINOv2 特征
+            dis_enc = []
+            for i, src in enumerate(srcs):
+                src_da = src.flatten(2).transpose(1, 2)  # [B, C, H, W] -> [B, H * W, C]
+                dis_enc.append(self.dis_enc(self.GRL(src_da))) # [B, H * W, 1]
+            da_output['enc_outputs'] = torch.cat(dis_enc, dim=1)  
+            # b. 对齐 Object Queries 的特征     
+            dis_dec = []
+            for i, hs_da in enumerate(hs):
+                dis_dec.append(self.dis_dec(self.GRL(hs_da)))  # [B, num_queries, 1]
+            da_output['dec_outputs'] = torch.cat(dis_dec, dim=1) 
+            # hs_da = hs.transpose(0, 1)  # [n_head, B, num_queries, C] -> [B, n_head, num_queries, C]       
+            # if self.attention_align:
+            #     attention_maps = [attention_map[:B // 2] for attention_map in attention_maps]
+            #     da_output['attention'] = []
+            #     for i, attention_map in enumerate(attention_maps):
+            #         stats = self.attention_discriminator.calculate_attention_stats(attention_map)
+            #         da_output['attention'].append(stats)
+            #     da_output['attention'] = torch.stack(da_output['attention'], dim=1)
+            #     out_attention_maps = []
+            #     for i, attention_map in enumerate(attention_maps):
+            #         out_attention_maps.append(self.attention_discriminator(attention_map))
+            #     da_output['backbone'] = torch.cat(out_attention_maps, dim=1)  # [B, num_patches, 1]
 
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
         if self.aux_loss:
@@ -173,8 +258,16 @@ class DeformableDETR(nn.Module):
             enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
             out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
 
-        if self.training and self.uda:
+        
+        
+        if self.training:
+            # --- 添加MAE重建的输出 ---
+            mae_output = {}
+            mae_output['mae_reconstructed'] = F_reconstructed
+            mae_output['mae_tezcher'] = [f_teacher.detach() for f_teacher in F_teacher]
+            
             out['da_output'] = da_output
+            out['mae_output'] = mae_output
         
         return out
 
@@ -399,8 +492,16 @@ class SetCriterion(nn.Module):
 
         if 'da_output' in outputs:
             for k, v in outputs['da_output'].items():
+                k = k.split('_')[0] 
                 losses[f'loss_{k}'] = self.loss_da(v, use_focal=False)  #对于query的均为focal loss
-        
+        if 'mae_output' in outputs:
+            F_reconstructed = outputs['mae_output']['mae_reconstructed']
+            F_teacher = outputs['mae_output']['mae_tezcher']
+            num_layers = len(F_teacher)
+            losses['loss_mae'] = 0.0
+            for i in range(num_layers):
+                losses['loss_mae'] += F.mse_loss(F_reconstructed[i], F_teacher[i])
+            losses['loss_mae'] /= num_layers
         return losses
 
 
@@ -453,63 +554,6 @@ class MLP(nn.Module):
             x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
 
-class AttentionDiscriminator(nn.Module):
-    """
-    一个域判别器，专门用于对齐 Attention Map 的行为模式。
-    它接收注意力图，提取其统计特征（如熵），然后判断其来源域。
-    """
-    def __init__(self, input_dim, hidden_dim, num_layers=3):
-        super().__init__()
-        self.grl = GradientReversal()
-        # 判别器本身是一个简单的MLP，输入维度为2（熵 + 最大注意力值）
-        self.discriminator = MLP(2, hidden_dim, 1, num_layers)
-
-    def calculate_attention_stats(self, attention_map):
-        """
-        从注意力图中计算统计特征。
-        Args:
-            attention_map (Tensor): 形状为 [B, num_heads, N, N]
-        Returns:
-            Tensor: 形状为 [B, N, 2] 的统计特征 (熵, 最大值)
-        """
-        # 1. 对所有头取平均，得到一个更鲁棒的注意力图 [B, N, N]
-        avg_attention = attention_map.mean(dim=1)
-        
-        # 加上一个极小值防止log(0)
-        avg_attention = avg_attention + 1e-9
-
-        # 2. 计算香农熵 H(p) = -sum(p * log(p))
-        # 熵表示注意力分布的“不确定性”或“分散度”
-        log_attention = torch.log2(avg_attention)
-        entropy = -torch.sum(avg_attention * log_attention, dim=-1) # 形状: [B, N]
-
-        # 3. 计算最大注意力值
-        # 最大值表示注意力分布的“集中度”
-        max_attention, _ = torch.max(avg_attention, dim=-1) # 形状: [B, N]
-        
-        # 4. 将两个统计量拼接成特征向量
-        # 形状从 [B, N] -> [B, N, 1]，然后拼接成 [B, N, 2]
-        stats = torch.stack([entropy, max_attention], dim=-1)
-        
-        return stats
-
-    def forward(self, attention_map):
-        """
-        前向传播。
-        """
-        # 1. 从注意力图中提取统计特征
-        stats = self.calculate_attention_stats(attention_map) # [B, N, 2]
-        
-        # 2. 应用GRL
-        reversed_stats = self.grl(stats)
-        
-        # 3. 通过判别器得到域预测得分
-        # discriminator 输入 [B*N, 2], 输出 [B*N, 1]
-        domain_logits = self.discriminator(reversed_stats.view(-1, 2))
-        
-        # 调整形状为 [B, N, 1]
-        return domain_logits.view(stats.shape[0], stats.shape[1], 1)
-    
 
 def build(args):
     # num_classes = 20 if args.dataset_file != 'coco' else 91
@@ -518,11 +562,12 @@ def build(args):
     num_classes = args.num_classes    
     device = torch.device(args.device)
 
-    backbone = build_backbone(args)
+    backbone, backbone_freezed = build_backbone(args)
     args.num_feature_levels = len(backbone[0].projector_scale) if hasattr(backbone[0], 'projector_scale') else args.num_feature_levels
     transformer = build_deforamble_transformer(args)
     model = DeformableDETR(
         backbone,
+        backbone_freezed,
         transformer,
         num_classes=num_classes,
         num_queries=args.num_queries,
@@ -547,7 +592,10 @@ def build(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
-    weight_dict['loss_backbone'] = args.backbone_loss_coef
+        
+    weight_dict['loss_enc'] = args.loss_enc_dis_coef
+    weight_dict['loss_dec'] = args.loss_dec_dis_coef
+    weight_dict['loss_mae'] = args.loss_mae_coef
 
     losses = ['labels', 'boxes', 'cardinality']
     if args.masks:
