@@ -145,25 +145,23 @@ def make_coco_transforms(image_set, args):
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
-
-    is_vit_backbone = 'dino' in args.backbone
-    patch_size = 14 if is_vit_backbone else 1
-
-    scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800] if not is_vit_backbone \
-         else compute_multi_scale_scales(644, patch_size, expanded_scales=True)
+    # scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800] if not is_vit_backbone \
+    #      else compute_multi_scale_scales(644, patch_size, expanded_scales=True)
+    # scales = [448, 476, 504, 532, 560, 616, 672, 700, 728, 756, 784]
 
     if image_set == 'train':
 
         return T.Compose([
             T.RandomHorizontalFlip(),
-            T.RandomSelect(
-                T.RandomResize(scales, max_size=1333),
-                T.Compose([
-                    T.RandomResize([400, 500, 600]),
-                    T.RandomSizeCrop(384, 600),
-                    T.RandomResize(scales, max_size=1333),
-                ])
-            ),
+            T.RandomResize([args.img_size], max_size=1333),
+            # T.RandomSelect(
+            #     T.RandomResize(scales, max_size=1333),
+            #     T.Compose([
+            #         T.RandomResize([400, 500, 600]),
+            #         T.RandomSizeCrop(384, 600),
+            #         T.RandomResize([644], max_size=1333),
+            #     ])
+            # ),
             normalize,
         ])
 
@@ -171,7 +169,7 @@ def make_coco_transforms(image_set, args):
         
     
         return T.Compose([
-            T.RandomResize([798 if is_vit_backbone else 800], max_size=1333),
+            T.RandomResize([args.img_size], max_size=1333),
             normalize,
         ])
 
