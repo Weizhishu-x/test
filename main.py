@@ -34,7 +34,7 @@ def get_args_parser():
     parser.add_argument('--lr_backbone', default=2e-5, type=float)
     parser.add_argument('--lr_linear_proj_names', default=['reference_points', 'sampling_offsets'], type=str, nargs='+')
     parser.add_argument('--lr_linear_proj_mult', default=0.1, type=float)
-    parser.add_argument('--batch_size', default=2, type=int)
+    parser.add_argument('--batch_size', default=4, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=50, type=int)
     parser.add_argument('--lr_drop', default=40, type=int)
@@ -61,9 +61,11 @@ def get_args_parser():
     projector_scale：
     visualize: 是否可视化模型，默认不可视化
     """
-    parser.add_argument('--projector_scale', default=[4.0, 2.0, 1.0, 0.5], type=str, nargs='+')
+    parser.add_argument('--feature_extraction_layers', default=[2, 5, 8, 11], type=int, nargs='+')
+    parser.add_argument('--projector_scale', default=[4.0, 2.0, 1.0, 0.5], type=float, nargs='+')
     parser.add_argument('--visualize', default=False, action='store_true')
     parser.add_argument('--DA_mode', default='uda', type=str, choices=['uda', 'oracle', 'source_only'])
+    parser.add_argument('--attention_align', default=False, action='store_true',)
     parser.add_argument('--backbone_loss_coef', default=0.1, type=float)
     # ==================================
     parser.add_argument('--dilation', action='store_true',
@@ -115,6 +117,10 @@ def get_args_parser():
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
     parser.add_argument('--giou_loss_coef', default=2, type=float)
     parser.add_argument('--focal_alpha', default=0.25, type=float)
+    # --- DA parameters ---
+    parser.add_argument('--loss_enc_dis_coef', default=0.3, type=float)
+    parser.add_argument('--loss_dec_dis_coef', default=0.3, type=float)
+    parser.add_argument('--loss_mae_coef', default=1, type=float)
 
     # dataset parameters
     parser.add_argument('--num_classes', default=4, type=int)
@@ -122,8 +128,8 @@ def get_args_parser():
     parser.add_argument('--coco_path', default='/input0', type=str)
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
-
-    parser.add_argument('--output_dir', default='./output_DINOv2_test',
+    parser.add_argument('--img_size', default=700, type=int)
+    parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
@@ -159,10 +165,12 @@ def main(args):
 
     model, criterion, postprocessors = build_model(args)
     model.to(device)
-
+  
     model_without_ddp = model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
+    with open(args.output_dir + '/args.txt', 'a') as f:
+        f.write(f'\nnumber of params: {n_parameters}\n')
 
     dataset_train = build_dataset(image_set='train', args=args)
     dataset_val = build_dataset(image_set='val', args=args)
@@ -208,6 +216,8 @@ def main(args):
 
     for n, p in model_without_ddp.named_parameters():
         print(n)
+        with open(args.output_dir + '/args.txt', 'a') as f:
+            f.write(f'{n}\n')
 
     param_dicts = [
         {
@@ -313,6 +323,7 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_train.set_epoch(epoch)
+        
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm)
         lr_scheduler.step()

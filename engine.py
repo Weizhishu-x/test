@@ -20,7 +20,7 @@ import util.misc as utils
 from datasets.coco_eval import CocoEvaluator
 from datasets.panoptic_eval import PanopticEvaluator
 from datasets.data_prefetcher import data_prefetcher
-
+from datasets.patchify_and_mask import patchify_and_mask
 from pathlib import Path
 from util.plot_utils import visualize_bboxes
 from util import box_ops
@@ -105,11 +105,11 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             output_dir=os.path.join(output_dir, "panoptic_eval"),
         )
 
-    for samples, targets in metric_logger.log_every(data_loader, 10, header):
+    for samples, _, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        outputs = model(samples)
+        outputs = model(samples, targets)
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
